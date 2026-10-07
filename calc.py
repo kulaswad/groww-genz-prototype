@@ -358,11 +358,142 @@ def calculate_drawdown_metrics(
     }
 
 
+def analyze_largest_nav_fall(
+    nav_history: Sequence[dict],
+    amount: float = 10_000.0,
+) -> dict:
+    """Find the largest peak-to-trough NAV fall and track a lump-sum value through it."""
+    if amount <= 0:
+        raise ValueError("Amount must be positive.")
+    if not nav_history:
+        raise ValueError("NAV history is empty.")
+
+    observations = sorted(
+        ((_to_date(item["date"]), float(item["nav"])) for item in nav_history),
+        key=lambda item: item[0],
+    )
+    if any(nav <= 0 for _, nav in observations):
+        raise ValueError("NAV values must be positive.")
+
+    peak_date, peak_nav = observations[0]
+    peak_index = 0
+    largest_fall = 0.0
+    selected = (peak_index, peak_index, peak_nav, peak_nav)
+    for index, (nav_date, nav_value) in enumerate(observations):
+        if nav_value > peak_nav:
+            peak_date, peak_nav = nav_date, nav_value
+            peak_index = index
+        fall = (peak_nav - nav_value) / peak_nav
+        if fall > largest_fall:
+            largest_fall = fall
+            selected = (peak_index, index, peak_nav, nav_value)
+
+    selected_peak_index, trough_index, selected_peak_nav, trough_nav = selected
+    selected_peak_date = observations[selected_peak_index][0]
+    trough_date = observations[trough_index][0]
+    recovery = next(
+        (
+            (nav_date, nav_value)
+            for nav_date, nav_value in observations[trough_index + 1 :]
+            if nav_value >= selected_peak_nav
+        ),
+        None,
+    )
+    latest_date, latest_nav = observations[-1]
+    return {
+        "peak_date": selected_peak_date.isoformat(),
+        "peak_nav": selected_peak_nav,
+        "trough_date": trough_date.isoformat(),
+        "trough_nav": trough_nav,
+        "fall_pct": largest_fall,
+        "trough_value": amount * trough_nav / selected_peak_nav,
+        "latest_date": latest_date.isoformat(),
+        "latest_nav": latest_nav,
+        "latest_value": amount * latest_nav / selected_peak_nav,
+        "recovery_date": recovery[0].isoformat() if recovery is not None else None,
+        "recovery_days": (recovery[0] - trough_date).days if recovery is not None else None,
+        "history": [
+            {
+                "date": nav_date.isoformat(),
+                "value": amount * nav_value / selected_peak_nav,
+            }
+            for nav_date, nav_value in observations[selected_peak_index : trough_index + 1]
+        ],
+    }
+
+
+def convert_habit_to_monthly_amount(
+    amount: float,
+    frequency: str,
+    minimum: float = 100.0,
+    maximum: float = 5_000.0,
+) -> dict:
+    """Convert a habit cost to a monthly equivalent and clamp the displayed amount."""
+    if amount < 0:
+        raise ValueError("Habit amount cannot be negative.")
+    if minimum <= 0 or maximum < minimum:
+        raise ValueError("Monthly amount limits are invalid.")
+
+    multipliers = {"daily": 30.0, "weekly": 4.33, "monthly": 1.0}
+    if frequency not in multipliers:
+        raise ValueError("Frequency must be daily, weekly, or monthly.")
+
+    raw_monthly = amount * multipliers[frequency]
+    monthly_amount = min(max(raw_monthly, minimum), maximum)
+    return {
+        "raw_monthly_amount": raw_monthly,
+        "monthly_amount": monthly_amount,
+        "is_capped": raw_monthly > maximum,
+        "was_raised_to_minimum": raw_monthly < minimum,
+    }
+
+
+def _stress_start_dates(
+    nav_dates: Sequence[date],
+    tenure_months: int,
+    instalment_day: int,
+) -> list[date]:
+    if not nav_dates:
+        return []
+    first_date = min(nav_dates)
+    last_date = max(nav_dates)
+    month_count = (last_date.year - first_date.year) * 12 + last_date.month - first_date.month + 1
+    starts = []
+    for scheduled_start in _scheduled_monthly_dates(
+        date(first_date.year, first_date.month, min(instalment_day, monthrange(first_date.year, first_date.month)[1])),
+        month_count,
+    ):
+        window_end = _scheduled_monthly_dates(scheduled_start, tenure_months + 1)[-1]
+        if window_end > last_date:
+            continue
+        try:
+            for scheduled_contribution in _scheduled_monthly_dates(scheduled_start, tenure_months):
+                _next_nav_date(scheduled_contribution, nav_dates)
+        except ValueError:
+            continue
+        starts.append(scheduled_start)
+    return starts
+
+
+def stress_test_window_count(
+    nav_history: Sequence[dict],
+    tenure_months: int,
+    instalment_day: int = 5,
+) -> int:
+    if tenure_months <= 0:
+        raise ValueError("Tenure must be positive.")
+    if instalment_day < 1 or instalment_day > 31:
+        raise ValueError("Instalment day must be between 1 and 31.")
+    nav_dates = sorted({_to_date(item["date"]) for item in nav_history})
+    return len(_stress_start_dates(nav_dates, tenure_months, instalment_day))
+
+
 def stress_test_windows(
     amount: float,
     tenure_months: int,
     nav_history: Sequence[dict],
     selected_window: tuple[str | date | datetime, str | date | datetime],
+    instalment_day: int = 5,
 ) -> dict:
     """Slide a window of length tenure_months across the NAV series and rank windows by XIRR."""
     if amount <= 0:
@@ -377,10 +508,8 @@ def stress_test_windows(
     selected_end = _to_date(selected_window[1])
 
     windows: list[dict] = []
-    for index, start_date in enumerate(nav_dates):
-        if index + tenure_months >= len(nav_dates):
-            break
-        end_date = nav_dates[index + tenure_months]
+    for start_date in _stress_start_dates(nav_dates, tenure_months, instalment_day):
+        end_date = _scheduled_monthly_dates(start_date, tenure_months + 1)[-1]
         projection = calculate_sip_projection(
             amount=amount,
             start_date=start_date,
@@ -388,10 +517,14 @@ def stress_test_windows(
             months=tenure_months,
             as_of_date=end_date,
         )
+        if not projection["available"]:
+            continue
         windows.append(
             {
                 "start_date": start_date.isoformat(),
-                "end_date": end_date.isoformat(),
+                "end_date": projection["as_of_date"],
+                "total_invested": float(projection["total_invested"]),
+                "ending_value": float(projection["current_value"]),
                 "xirr": float(projection["xirr"]),
                 "absolute_return_pct": float(projection["absolute_return_pct"]),
             }
@@ -408,9 +541,13 @@ def stress_test_windows(
         months=tenure_months,
         as_of_date=selected_end,
     )
+    if not selected_projection["available"]:
+        raise ValueError(selected_projection["message"])
     selected_result = {
         "start_date": selected_start.isoformat(),
         "end_date": selected_end.isoformat(),
+        "total_invested": float(selected_projection["total_invested"]),
+        "ending_value": float(selected_projection["current_value"]),
         "xirr": float(selected_projection["xirr"]),
         "absolute_return_pct": float(selected_projection["absolute_return_pct"]),
     }
